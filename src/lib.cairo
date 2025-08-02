@@ -70,6 +70,7 @@ mod HTLCEscrow {
     const UNAUTHORIZED_ACCESS: felt252 = 'Unauthorized access';
     const INSUFFICIENT_BALANCE: felt252 = 'Insufficient balance';
     const INVALID_TIMELOCK: felt252 = 'Invalid timelock';
+    const CANNOT_CANCEL: felt252 = 'Cannot cancel';
 
     #[storage]
     struct Storage {
@@ -238,31 +239,26 @@ mod HTLCEscrow {
         }
 
         fn cancel(ref self: ContractState, escrow_id: felt252) {
-            // let mut escrow = self.escrows.read(escrow_id);
-            // let caller = get_caller_address();
-            // let current_time = get_block_timestamp();
+            // Validation checks
+            let caller = get_caller_address();
+            let mut escrow = self.escrows.read(escrow_id);
+            assert(caller == escrow.sender, UNAUTHORIZED_ACCESS);
+            assert(self.can_cancel(escrow_id), CANNOT_CANCEL);
+
+            // Mark as cancelled
+            escrow.cancelled = true;
+            self.escrows.write(escrow_id, escrow.clone());
             
-            // // Validation checks
-            // assert(escrow.amount > 0, 'Escrow not found');
-            // assert(!escrow.withdrawn, 'Already withdrawn');
-            // assert(!escrow.cancelled, 'Already cancelled');
-            // assert(caller == escrow.sender, 'Only sender can cancel');
-            // assert(current_time >= escrow.timelock, 'Timelock not expired');
+            // Refund tokens to sender
+            let token = IERC20Dispatcher { contract_address: escrow.token_address };
+            token.transfer(escrow.sender, escrow.amount);
             
-            // // Mark as cancelled
-            // escrow.cancelled = true;
-            // self.escrows.write(escrow_id, escrow);
-            
-            // // Refund tokens to sender
-            // let token = IERC20Dispatcher { contract_address: escrow.token_address };
-            // token.transfer(escrow.sender, escrow.amount);
-            
-            // // Emit event
-            // self.emit(EscrowCancelled {
-            //     escrow_id: escrow_id,
-            //     sender: escrow.sender,
-            //     order_id: escrow.order_id,
-            // });
+            // Emit event
+            self.emit(EscrowCancelled {
+                escrow_id: escrow_id,
+                sender: escrow.sender,
+                order_id: escrow.order_id,
+            });
         }
 
         fn get_escrow(self: @ContractState, escrow_id: felt252) -> Escrow {
@@ -282,10 +278,9 @@ mod HTLCEscrow {
         }
 
         fn can_cancel(self: @ContractState, escrow_id: felt252) -> bool {
-            // let escrow = self.escrows.read(escrow_id);
-            // let current_time = get_block_timestamp();
-            // escrow.amount > 0 && !escrow.withdrawn && !escrow.cancelled && current_time >= escrow.timelock
-            true
+            let escrow = self.escrows.read(escrow_id);
+            let current_time = get_block_timestamp();
+            escrow.amount > 0 && !escrow.withdrawn && !escrow.cancelled && current_time >= escrow.timelock
         }
 
         fn get_escrow_balance(self: @ContractState, escrow_id: felt252) -> u256 {
