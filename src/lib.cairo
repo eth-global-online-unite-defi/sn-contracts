@@ -2,7 +2,7 @@ use starknet::{ContractAddress, get_caller_address, get_block_timestamp, get_con
 use core::poseidon::poseidon_hash_span;
 
 /// Escrow struct to store all escrow details
-#[derive(Drop, Serde, starknet::Store)]
+#[derive(Drop, Serde, starknet::Store, Clone)]
 pub struct Escrow {
     pub sender: ContractAddress,
     pub receiver: ContractAddress,
@@ -11,7 +11,7 @@ pub struct Escrow {
     pub timelock: u64,
     pub withdrawn: bool,
     pub cancelled: bool,
-    pub token_address: ContractAddress, // 0 address for native ETH
+    pub token_address: ContractAddress,
     pub order_id: felt252,
     pub created_at: u64,
 }
@@ -42,7 +42,7 @@ pub trait IHTLCEscrow<TContractState> {
     
     fn can_cancel(self: @TContractState, escrow_id: felt252) -> bool;
     
-    fn get_contract_balance(self: @TContractState) -> u256;
+    fn get_escrow_balance(self: @TContractState, escrow_id: felt252) -> u256;
 }
 
 /// HTLC Escrow Contract for Starknet
@@ -59,9 +59,13 @@ mod HTLCEscrow {
 
     // Error constants
     const ESCROW_NOT_FOUND: felt252 = 'Escrow not found';
+    const ORDER_ALREADY_USED: felt252 = 'Order already used';
     const ALREADY_WITHDRAWN: felt252 = 'Already withdrawn';
     const ALREADY_CANCELLED: felt252 = 'Already cancelled';
     const INVALID_SECRET: felt252 = 'Invalid secret';
+    const INVALID_AMOUNT: felt252 = 'Invalid amount';
+    const INVALID_ADDRESS: felt252 = 'Invalid address';
+    const INVALID_ORDER_ID: felt252 = 'Invalid order ID';
     const TIMELOCK_NOT_EXPIRED: felt252 = 'Timelock not expired';
     const UNAUTHORIZED_ACCESS: felt252 = 'Unauthorized access';
     const INSUFFICIENT_BALANCE: felt252 = 'Insufficient balance';
@@ -133,12 +137,13 @@ mod HTLCEscrow {
             receiver: ContractAddress,
             order_id: felt252
         ) -> felt252 {
+            let token = IERC20Dispatcher { contract_address: token_address };
+
             // Validation checks
-            assert(!token_address.is_zero(), 'Invalid token address');
-            assert(amount > 0, 'Amount cannot be zero');
+            assert(amount > 0, INVALID_AMOUNT);
             assert(timelock > get_block_timestamp(), INVALID_TIMELOCK);
-            assert(!receiver.is_zero(), 'Invalid receiver address');
-            assert(order_id != 0, 'Order ID cannot be zero');
+            assert(!receiver.is_zero() && !token_address.is_zero(), INVALID_ADDRESS);
+            assert(order_id != 0, INVALID_ORDER_ID);
             
             let sender = get_caller_address();
             
@@ -163,10 +168,11 @@ mod HTLCEscrow {
             
             // Check if order ID is already used
             let existing_order_escrow = self.order_to_escrow_id.read(order_id);
-            assert(existing_order_escrow == 0, 'Order ID already used');
+            assert(existing_order_escrow == 0, ORDER_ALREADY_USED);
             
-            // Transfer tokens to this contract
-            let token = IERC20Dispatcher { contract_address: token_address };
+            let sender_balance = token.balance_of(sender);
+            assert(sender_balance >= amount, INSUFFICIENT_BALANCE);
+
             token.transfer_from(sender, starknet::get_contract_address(), amount);
             
             // Create and store escrow
@@ -202,11 +208,61 @@ mod HTLCEscrow {
         }
 
         fn withdraw(ref self: ContractState, escrow_id: felt252, secret: felt252) {
-
+            // Validation checks
+            let caller = get_caller_address();
+            let mut escrow = self.escrows.read(escrow_id);
+            assert(escrow.amount != 0, ESCROW_NOT_FOUND);
+            assert(!escrow.withdrawn, ALREADY_WITHDRAWN);
+            assert(!escrow.cancelled, ALREADY_CANCELLED);
+            assert(caller == escrow.receiver, UNAUTHORIZED_ACCESS);
+            
+            //  Verify secret matches hash
+            let provided_hash = poseidon_hash_span(array![secret].span());
+            assert(provided_hash == escrow.secret_hash, INVALID_SECRET);
+            
+            // Mark as withdrawn
+            escrow.withdrawn = true;
+            self.escrows.write(escrow_id, escrow.clone());
+            
+            // Transfer tokens to receiver
+            let token = IERC20Dispatcher { contract_address: escrow.token_address };
+            token.transfer(escrow.receiver, escrow.amount);
+            
+            // Emit event
+            self.emit(EscrowWithdrawn {
+                escrow_id: escrow_id,
+                receiver: escrow.receiver,
+                secret: secret,
+                order_id: escrow.order_id,
+            });
         }
 
         fn cancel(ref self: ContractState, escrow_id: felt252) {
-
+            // let mut escrow = self.escrows.read(escrow_id);
+            // let caller = get_caller_address();
+            // let current_time = get_block_timestamp();
+            
+            // // Validation checks
+            // assert(escrow.amount > 0, 'Escrow not found');
+            // assert(!escrow.withdrawn, 'Already withdrawn');
+            // assert(!escrow.cancelled, 'Already cancelled');
+            // assert(caller == escrow.sender, 'Only sender can cancel');
+            // assert(current_time >= escrow.timelock, 'Timelock not expired');
+            
+            // // Mark as cancelled
+            // escrow.cancelled = true;
+            // self.escrows.write(escrow_id, escrow);
+            
+            // // Refund tokens to sender
+            // let token = IERC20Dispatcher { contract_address: escrow.token_address };
+            // token.transfer(escrow.sender, escrow.amount);
+            
+            // // Emit event
+            // self.emit(EscrowCancelled {
+            //     escrow_id: escrow_id,
+            //     sender: escrow.sender,
+            //     order_id: escrow.order_id,
+            // });
         }
 
         fn get_escrow(self: @ContractState, escrow_id: felt252) -> Escrow {
@@ -220,8 +276,9 @@ mod HTLCEscrow {
         }
 
         fn verify_secret(self: @ContractState, escrow_id: felt252, secret: felt252) -> bool {
-
-            true
+            let escrow = self.escrows.read(escrow_id);
+            let provided_hash = poseidon_hash_span(array![secret].span());
+            provided_hash == escrow.secret_hash
         }
 
         fn can_cancel(self: @ContractState, escrow_id: felt252) -> bool {
@@ -231,10 +288,10 @@ mod HTLCEscrow {
             true
         }
 
-        fn get_contract_balance(self: @ContractState) -> u256 {
-            // Note: This function would need the token address to check balance
-            // For now, return 0 as it needs to be implemented per token
-            0
+        fn get_escrow_balance(self: @ContractState, escrow_id: felt252) -> u256 {
+            let escrow = self.escrows.read(escrow_id);
+            let token = IERC20Dispatcher { contract_address: escrow.token_address };
+            token.balance_of(starknet::get_contract_address())
         }
     }
 }
